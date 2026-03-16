@@ -107,6 +107,8 @@ pub struct L2Client {
     blocks_cache: MeteredCache<B256, OpBlock>,
     /// Cache for headers by hash.
     headers_cache: MeteredCache<B256, Header>,
+    /// Cache mapping block number to block hash, used as an index into the hash-keyed caches.
+    number_to_hash: MeteredCache<u64, B256>,
     /// Cache for account proofs.
     proofs_cache: MeteredCache<ProofCacheKey, AccountResult>,
     /// Retry configuration.
@@ -118,6 +120,7 @@ impl std::fmt::Debug for L2Client {
         f.debug_struct("L2Client")
             .field("blocks_cache_entries", &self.blocks_cache.entry_count())
             .field("headers_cache_entries", &self.headers_cache.entry_count())
+            .field("number_to_hash_entries", &self.number_to_hash.entry_count())
             .field("proofs_cache_entries", &self.proofs_cache.entry_count())
             .finish_non_exhaustive()
     }
@@ -147,10 +150,12 @@ impl L2Client {
 
         let mut blocks_cache = MeteredCache::with_capacity("l2_blocks", config.cache_size);
         let mut headers_cache = MeteredCache::with_capacity("l2_headers", config.cache_size);
+        let mut number_to_hash = MeteredCache::with_capacity("l2_number_to_hash", config.cache_size);
         let mut proofs_cache = MeteredCache::with_capacity("l2_proofs", config.cache_size);
         if let Some(prefix) = &config.metrics_prefix {
             blocks_cache = blocks_cache.with_metrics_prefix(prefix);
             headers_cache = headers_cache.with_metrics_prefix(prefix);
+            number_to_hash = number_to_hash.with_metrics_prefix(prefix);
             proofs_cache = proofs_cache.with_metrics_prefix(prefix);
         }
 
@@ -158,6 +163,7 @@ impl L2Client {
             provider,
             blocks_cache,
             headers_cache,
+            number_to_hash,
             proofs_cache,
             retry_config: config.retry_config,
         })
@@ -173,6 +179,11 @@ impl L2Client {
         &self.headers_cache
     }
 
+    /// Returns the number-to-hash index cache.
+    pub const fn number_to_hash_cache(&self) -> &MeteredCache<u64, B256> {
+        &self.number_to_hash
+    }
+
     /// Returns the proofs cache.
     pub const fn proofs_cache(&self) -> &MeteredCache<ProofCacheKey, AccountResult> {
         &self.proofs_cache
@@ -186,6 +197,20 @@ impl L2Client {
     /// Returns a reference to the retry configuration.
     pub const fn retry_config(&self) -> &RetryConfig {
         &self.retry_config
+    }
+
+    /// Looks up a header by block number using the number-to-hash index cache.
+    /// Returns `None` for `Latest` queries or on cache miss.
+    async fn cached_header_by_number(&self, number: Option<u64>) -> Option<Header> {
+        let hash = self.number_to_hash.get(&number?).await?;
+        self.headers_cache.get(&hash).await
+    }
+
+    /// Looks up a block by block number using the number-to-hash index cache.
+    /// Returns `None` for `Latest` queries or on cache miss.
+    async fn cached_block_by_number(&self, number: Option<u64>) -> Option<OpBlock> {
+        let hash = self.number_to_hash.get(&number?).await?;
+        self.blocks_cache.get(&hash).await
     }
 }
 
@@ -240,6 +265,11 @@ impl L2Provider for L2Client {
     }
 
     async fn header_by_number(&self, number: Option<u64>) -> RpcResult<Header> {
+        // For specific block numbers, check the number-to-hash index first
+        if let Some(header) = self.cached_header_by_number(number).await {
+            return Ok(header);
+        }
+
         let block_id: BlockId =
             number.map_or(BlockNumberOrTag::Latest, BlockNumberOrTag::Number).into();
 
@@ -258,13 +288,19 @@ impl L2Provider for L2Client {
 
         let header = block.header;
 
-        // Cache by hash
+        // Cache by hash and update number-to-hash index
         self.headers_cache.insert(header.hash, header.clone()).await;
+        self.number_to_hash.insert(header.inner.number, header.hash).await;
 
         Ok(header)
     }
 
     async fn block_by_number(&self, number: Option<u64>) -> RpcResult<OpBlock> {
+        // For specific block numbers, check the number-to-hash index first
+        if let Some(block) = self.cached_block_by_number(number).await {
+            return Ok(block);
+        }
+
         let block_id: BlockId =
             number.map_or(BlockNumberOrTag::Latest, BlockNumberOrTag::Number).into();
 
@@ -281,9 +317,10 @@ impl L2Provider for L2Client {
         .await?
         .ok_or_else(|| RpcError::BlockNotFound(format!("Block not found for {block_id:?}")))?;
 
-        // Cache by hash
+        // Cache by hash and update number-to-hash index
         self.blocks_cache.insert(block.header.hash, block.clone()).await;
         self.headers_cache.insert(block.header.hash, block.header.clone()).await;
+        self.number_to_hash.insert(block.header.inner.number, block.header.hash).await;
 
         Ok(block)
     }

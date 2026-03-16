@@ -89,6 +89,8 @@ pub struct L1Client {
     provider: HttpProvider,
     /// Cache for headers by hash.
     headers_cache: MeteredCache<B256, Header>,
+    /// Cache mapping block number to block hash, used as an index into the hash-keyed caches.
+    number_to_hash: MeteredCache<u64, B256>,
     /// Cache for receipts by block hash.
     receipts_cache: MeteredCache<B256, Vec<TransactionReceipt>>,
     /// Retry configuration.
@@ -99,6 +101,7 @@ impl std::fmt::Debug for L1Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("L1Client")
             .field("headers_cache_entries", &self.headers_cache.entry_count())
+            .field("number_to_hash_entries", &self.number_to_hash.entry_count())
             .field("receipts_cache_entries", &self.receipts_cache.entry_count())
             .finish_non_exhaustive()
     }
@@ -127,13 +130,21 @@ impl L1Client {
         let provider = RootProvider::new(rpc_client);
 
         let mut headers_cache = MeteredCache::with_capacity("l1_headers", config.cache_size);
+        let mut number_to_hash = MeteredCache::with_capacity("l1_number_to_hash", config.cache_size);
         let mut receipts_cache = MeteredCache::with_capacity("l1_receipts", config.cache_size);
         if let Some(prefix) = &config.metrics_prefix {
             headers_cache = headers_cache.with_metrics_prefix(prefix);
+            number_to_hash = number_to_hash.with_metrics_prefix(prefix);
             receipts_cache = receipts_cache.with_metrics_prefix(prefix);
         }
 
-        Ok(Self { provider, headers_cache, receipts_cache, retry_config: config.retry_config })
+        Ok(Self {
+            provider,
+            headers_cache,
+            number_to_hash,
+            receipts_cache,
+            retry_config: config.retry_config,
+        })
     }
 
     /// Returns the headers cache metrics.
@@ -144,6 +155,18 @@ impl L1Client {
     /// Returns the receipts cache metrics.
     pub const fn receipts_cache(&self) -> &MeteredCache<B256, Vec<TransactionReceipt>> {
         &self.receipts_cache
+    }
+
+    /// Returns the number-to-hash index cache.
+    pub const fn number_to_hash_cache(&self) -> &MeteredCache<u64, B256> {
+        &self.number_to_hash
+    }
+
+    /// Looks up a header by block number using the number-to-hash index cache.
+    /// Returns `None` for `Latest` queries or on cache miss.
+    async fn cached_header_by_number(&self, number: Option<u64>) -> Option<Header> {
+        let hash = self.number_to_hash.get(&number?).await?;
+        self.headers_cache.get(&hash).await
     }
 }
 
@@ -162,6 +185,11 @@ impl L1Provider for L1Client {
     }
 
     async fn header_by_number(&self, number: Option<u64>) -> RpcResult<Header> {
+        // For specific block numbers, check the number-to-hash index first
+        if let Some(header) = self.cached_header_by_number(number).await {
+            return Ok(header);
+        }
+
         let block_id: BlockId =
             number.map_or(BlockNumberOrTag::Latest, BlockNumberOrTag::Number).into();
 
@@ -180,8 +208,9 @@ impl L1Provider for L1Client {
 
         let header = block.header;
 
-        // Cache the header by its hash
+        // Cache by hash and update number-to-hash index
         self.headers_cache.insert(header.hash, header.clone()).await;
+        self.number_to_hash.insert(header.inner.number, header.hash).await;
 
         Ok(header)
     }
